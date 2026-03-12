@@ -1,500 +1,499 @@
-# Some code based on https://github.com/thuml/Anomaly-Transformer
+"""
+AS2CL-AD Solver — 训练与测试主控模块
+参考论文第 4 章算法 1 (训练) 与算法 2 (推理)
+"""
 
+import os
+import time
+import logging
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import os
-import time
-from utils.utils import *
-from model.Transformer import TransformerVar
-from model.loss_functions import *
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    accuracy_score,
+    roc_auc_score,
+    average_precision_score,
+)
+from tqdm import tqdm
+
 from data_factory.data_loader import get_loader_segment
-import logging
-from sklearn.metrics import precision_recall_fscore_support
-from sklearn.metrics import accuracy_score
-import pandas as pd
-from metrics.metrics import *
 
-os.environ["CUDA_VISIBLE_DEVICES"] = '0, 1, 2, 3'
+# ── AS2CL-AD 核心模块 ────────────────────────────────────────────────────────
+from autoaug.fourier import FreRA                          # ASSA 频域增强
+from model.Transformer import AS2CLAD_Encoder             # Transformer + 投影头
+from model.embedding import VariableIndependentEmbedding  # 变量独立嵌入
+from model.attn_layer import DependencyPatternModule      # 依赖模式矩阵
+from model.dependency_soft_cl import (                    # 层次化软对比损失
+    total_loss,
+    hierarchical_dependency_soft_cl_loss,
+    maxpool_var_emb,
+    kl_divergence,
+)
 
-def adjust_learning_rate(optimizer, epoch, lr_):
-    lr_adjust = {epoch: lr_ * (0.5 ** ((epoch - 1) // 1))}
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        print('Updating learning rate to {}'.format(lr))
+# ── 评价指标 ─────────────────────────────────────────────────────────────────
+from metrics.affiliation.generics import convert_vector_to_events
+from metrics.affiliation.metrics import pr_from_events
+from metrics.AUC import point_wise_AUC
 
 
-class TwoEarlyStopping:
-    def __init__(self, patience=10, verbose=False, dataset_name='', delta=0, type=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# 工具函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def minmax_norm(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Min-Max 归一化到 [0, 1]"""
+    lo, hi = x.min(), x.max()
+    return (x - lo) / (hi - lo + eps)
+
+
+def adjust_learning_rate(optimizer, epoch: int, base_lr: float):
+    """每 epoch 指数衰减学习率"""
+    lr = base_lr * (0.5 ** ((epoch - 1) // 1))
+    for pg in optimizer.param_groups:
+        pg['lr'] = lr
+    print(f'  LR adjusted to {lr:.2e}')
+
+
+class EarlyStopping:
+    def __init__(self, patience: int = 10, dataset_name: str = ''):
         self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_score = None
-        self.best_score2 = None
-        self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.val_loss2_min = np.Inf
-        self.delta = delta
-        self.dataset = dataset_name
-
-    def __call__(self, val_loss, val_loss2, model, path):
-        score = -val_loss
-        score2 = -val_loss2
-        if self.best_score is None:
-            self.best_score = score
-            self.best_score2 = score2
-            self.save_checkpoint(val_loss, val_loss2, model, path)
-        elif score < self.best_score + self.delta or score2 < self.best_score2 + self.delta:
-            self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.best_score2 = score2
-            self.save_checkpoint(val_loss, val_loss2, model, path)
-            self.counter = 0
-
-    def save_checkpoint(self, val_loss, val_loss2, model, path):
-        if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + '_checkpoint.pth'))
-        self.val_loss_min = val_loss
-        self.val_loss2_min = val_loss2
-
-class OneEarlyStopping:
-    def __init__(self, patience=10, verbose=False, dataset_name='', delta=0, type=None):
-        self.patience = patience
-        self.verbose = verbose
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.delta = delta
         self.dataset = dataset_name
-        self.type = type
 
-    def __call__(self, val_loss, model, path):
+    def __call__(self, val_loss: float, models: dict, path: str):
         score = -val_loss
-        if self.best_score is None:
+        if self.best_score is None or score > self.best_score:
             self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-        elif score < self.best_score + self.delta:
+            self._save(models, path)
+            self.counter = 0
+        else:
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            print(f'  EarlyStopping: {self.counter}/{self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, path)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss, model, path):
-        if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-
-        torch.save(model.state_dict(), os.path.join(path, str(self.dataset) + f'_checkpoint_{self.type}.pth'))
-        self.val_loss_min = val_loss
+    def _save(self, models: dict, path: str):
+        for name, m in models.items():
+            ckpt = os.path.join(path, f'{self.dataset}_{name}.pth')
+            torch.save(m.state_dict(), ckpt)
+        print(f'  Checkpoint saved.')
 
 
-class Solver(object):
-    DEFAULTS = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# Solver
+# ─────────────────────────────────────────────────────────────────────────────
 
-    def __init__(self, config):
-        # 将默认配置和传入的config合并到对象的__dict__中（优先级：config > DEFAULTS）
-        self.__dict__.update(Solver.DEFAULTS, **config)
-        # 获取数据加载器：
-        # 1. 训练集、验证集
-        self.train_loader, self.vali_loader, self.k_loader = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                               mode='train',
-                                               dataset=self.dataset)
+class Solver:
+    """AS2CL-AD 训练 / 测试主控"""
 
-        # 2. 测试集（第二个返回值用_忽略，因为只需要测试集loader）
-        self.test_loader, _ = get_loader_segment(self.data_path, batch_size=self.batch_size, win_size=self.win_size,
-                                              mode='test',
-                                              dataset=self.dataset)
-        # 阈值计算用的loader（默认使用验证集loader）
-        self.thre_loader = self.vali_loader
-        
-        if self.memory_initial == "False":
-            
-            self.memory_initial = False
-        else:
-            self.memory_initial = True
+    def __init__(self, config: dict):
+        self.__dict__.update(config)
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.memory_init_embedding = None
+        # ── 数据加载 ──────────────────────────────────────────────────────────
+        self.train_loader, self.vali_loader, _ = get_loader_segment(
+            self.data_path, batch_size=self.batch_size,
+            win_size=self.win_size, mode='train', dataset=self.dataset
+        )
+        self.test_loader, _ = get_loader_segment(
+            self.data_path, batch_size=self.batch_size,
+            win_size=self.win_size, mode='test', dataset=self.dataset
+        )
 
-        # 构建模型（传入记忆初始化嵌入向量）
-        self.build_model(memory_init_embedding=self.memory_init_embedding)
+        # ── 构建模型 ──────────────────────────────────────────────────────────
+        self._build_model()
 
-
-        # 设置设备（优先使用GPU）
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # 定义损失函数：
-        # 1. 熵损失（用于记忆模块的正则化）
-        self.entropy_loss = EntropyLoss()
-        # 2. MSE损失（主损失函数）
-        self.criterion = nn.MSELoss()
-
-        self.logger = logging.getLogger()
+        # ── 日志 ──────────────────────────────────────────────────────────────
+        self.logger = logging.getLogger('AS2CL-AD')
         self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            h = logging.StreamHandler()
+            h.setFormatter(logging.Formatter('%(asctime)s %(message)s'))
+            self.logger.addHandler(h)
 
-        formatter = logging.Formatter('%(asctime)s - %(message)s')
-        stream_handler = logging.StreamHandler()
-        stream_handler.setFormatter(formatter)
-        self.logger.addHandler(stream_handler)
-        # file_handler = logging.FileHandler(f'./hyperparameters_tuning/memory_item_numbers/number_{self.dataset}.log')
-        # file_handler.setFormatter(formatter)
-        # self.logger.addHandler(file_handler)
+    # ─────────────────────────────────────────────────────────────────────────
+    def _build_model(self):
+        """初始化所有可训练模块"""
+        D = self.input_c
 
-    def build_model(self,memory_init_embedding):
+        # 1. ASSA 频域增强模块 (含可学习掩码 S ∈ R^F)
+        self.assa = FreRA(
+            len_sw=self.win_size,
+            alpha_limit=getattr(self, 'alpha_limit', 0.2),
+            noise_std=getattr(self, 'noise_std', 0.5),
+        ).to(self.device)
 
-        # 初始化TransformerVar模型（带记忆模块的Transformer变体）
-        self.model = TransformerVar(win_size=self.win_size, enc_in=self.input_c, c_out=self.output_c, \
-                                    e_layers=3, d_model=self.d_model, n_memory=self.n_memory, device=self.device, \
-                                    memory_initial=self.memory_initial, memory_init_embedding=memory_init_embedding, phase_type=self.phase_type, dataset_name=self.dataset)
-        # 使用Adam优化器（学习率来自配置）
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        # 2. 变量独立解耦嵌入 (用于依赖模式计算)
+        self.var_emb = VariableIndependentEmbedding(
+            n_vars=D,
+            d_emb=getattr(self, 'd_emb', 64),
+            max_len=self.win_size + 10,
+        ).to(self.device)
 
-        # 如果可用GPU，启用DataParallel并行（多GPU支持）
-        if torch.cuda.is_available():
-            self.model = torch.nn.DataParallel(self.model, device_ids=[0], output_device=0).to(self.device)
+        # 3. 依赖模式模块 (共享 W^Q, W^K)
+        self.dep_module = DependencyPatternModule(
+            d_emb=getattr(self, 'd_emb', 64),
+        ).to(self.device)
 
-    def vali(self, vali_loader):
-        self.model.eval()
+        # 4. Transformer 编码器 + 投影头 (连体, 两视图共享权重)
+        self.encoder = AS2CLAD_Encoder(
+            win_size=self.win_size,
+            enc_in=D,
+            d_model=self.d_model,
+            n_heads=getattr(self, 'n_heads', 8),
+            e_layers=getattr(self, 'e_layers', 3),
+            d_ff=getattr(self, 'd_ff', 512),
+            d_proj=getattr(self, 'd_proj', 128),
+            dropout=getattr(self, 'dropout', 0.0),
+            device=self.device,
+        ).to(self.device)
 
-        valid_loss_list = [] ; valid_re_loss_list = [] ; valid_entropy_loss_list = []
+        # ── 优化器: 覆盖所有可训练参数 ───────────────────────────────────────
+        params = (
+            list(self.assa.parameters())
+            + list(self.var_emb.parameters())
+            + list(self.dep_module.parameters())
+            + list(self.encoder.parameters())
+        )
+        self.optimizer = torch.optim.Adam(params, lr=self.lr)
 
-        for i, (input_data, _) in enumerate(vali_loader):
-            input = input_data.float().to(self.device)
-            output_dict = self.model(input)
-            output, queries, mem_items, attn = output_dict['out'], output_dict['queries'], output_dict['mem'], output_dict['attn']
-            
-            rec_loss = self.criterion(output, input)
-            entropy_loss = self.entropy_loss(attn)
-            loss = rec_loss + self.lambd*entropy_loss
+    # ─────────────────────────────────────────────────────────────────────────
+    def _load_checkpoint(self):
+        """加载所有模块的 checkpoint"""
+        for name, m in self._named_modules().items():
+            ckpt = os.path.join(self.model_save_path, f'{self.dataset}_{name}.pth')
+            m.load_state_dict(torch.load(ckpt, map_location=self.device))
+            print(f'  Loaded {ckpt}')
 
-            valid_re_loss_list.append(rec_loss.detach().cpu().numpy())
-            valid_entropy_loss_list.append(entropy_loss.detach().cpu().numpy())
-            valid_loss_list.append(loss.detach().cpu().numpy())
+    def _named_modules(self) -> dict:
+        return {
+            'assa': self.assa,
+            'var_emb': self.var_emb,
+            'dep_module': self.dep_module,
+            'encoder': self.encoder,
+        }
 
-        return np.average(valid_loss_list), np.average(valid_re_loss_list), np.average(valid_entropy_loss_list)
+    # ─────────────────────────────────────────────────────────────────────────
+    # 算法 1: 训练
+    # ─────────────────────────────────────────────────────────────────────────
+    def train(self):
+        print('=' * 55)
+        print('  TRAIN MODE  —  AS2CL-AD  (Algorithm 1)')
+        print('=' * 55)
 
-    def train(self, training_type):
+        os.makedirs(self.model_save_path, exist_ok=True)
+        early_stop = EarlyStopping(patience=10, dataset_name=self.dataset)
+        lambda_reg = getattr(self, 'lambda_reg', 0.5)   # λ for L_reg (公式 4.31)
+        n_hier     = getattr(self, 'n_hier', 3)          # 层次化池化层数
 
-        print("======================TRAIN MODE======================")
+        for epoch in range(1, self.num_epochs + 1):
+            self.assa.train()
+            self.var_emb.train()
+            self.dep_module.train()
+            self.encoder.train()
 
-        time_now = time.time()
-        path = self.model_save_path
-        if not os.path.exists(path):
-            os.makedirs(path) # 创建模型保存目录
-        # 早停机制（10轮无改进则停止）
-        early_stopping = OneEarlyStopping(patience=10, verbose=True, dataset_name=self.dataset, type=training_type)
-        train_steps = len(self.train_loader) # 计算每epoch迭代次数
+            loss_epoch, t0 = [], time.time()
 
-        from tqdm import tqdm
-        for epoch in tqdm(range(self.num_epochs)):
-            iter_count = 0
-            loss_list = []  # 总损失记录
-            rec_loss_list = []  # 重构损失记录
-            entropy_loss_list = []  # 熵损失记录
+            for batch_x, _ in tqdm(self.train_loader,
+                                   desc=f'Epoch {epoch}/{self.num_epochs}',
+                                   leave=False):
+                # ── 数据准备 ─────────────────────────────────────────────────
+                # x1: 原始视图  x2: ASSA 增强视图
+                # x1, x2: [B, L, D]
+                x1 = batch_x.float().to(self.device)
 
-            epoch_time = time.time()
-            self.model.train() # 切换训练模式
-            for i, (input_data, labels) in enumerate(self.train_loader):
-                
-                self.optimizer.zero_grad() # 清空梯度
-                iter_count += 1
-                # 数据转移到设备
-                input = input_data.float().to(self.device)
-                # 前向传播
-                output_dict = self.model(input_data) #数据经过模型的输出
+                # 算法 1 步骤 05: x2 ← ASSA_augment(x1)
+                # 训练模式下 assa 返回增强视图; M_freq 用于 L_reg
+                x2, M_freq = self.assa(x1)   # x2: [B,L,D], M_freq: [F]
 
-                # 解析模型输出
-                output, memory_item_embedding, queries, mem_items, attn = output_dict['out'], output_dict['memory_item_embedding'], output_dict['queries'], output_dict["mem"], output_dict['attn']
+                # ── 变量独立嵌入 → 层次化依赖模式 ────────────────────────────
+                # 算法 1 步骤 06-08: 计算 E_dec 和 W_DC
+                # E: [B, L, D, d_emb]
+                E = self.var_emb(x1)
 
-                # 计算损失
-                rec_loss = self.criterion(output, input)
-                entropy_loss = self.entropy_loss(attn)
-                loss = rec_loss + self.lambd*entropy_loss
+                # 构造层次化嵌入列表 (公式 4.21 MaxPool)
+                E_list = [E]
+                for _ in range(n_hier - 1):
+                    E = maxpool_var_emb(E)
+                    E_list.append(E)
 
-                # 记录损失
-                loss_list.append(loss.detach().cpu().numpy())
-                entropy_loss_list.append(entropy_loss.detach().cpu().numpy())
-                rec_loss_list.append(rec_loss.detach().cpu().numpy())
+                # ── Transformer 编码 + 投影头 ─────────────────────────────────
+                # 算法 1 步骤 09-17: 两视图共享编码器权重
+                # Z: [B, L, d_proj]  H: [B, L, d_model]
+                Z1, _ = self.encoder(x1)
+                Z2, _ = self.encoder(x2)
 
-                # 每100批打印进度
-                if (i + 1) % 100 == 0:
-                    speed = (time.time() - time_now) / iter_count
-                    left_time = speed * ((self.num_epochs - epoch) * train_steps - i)
-                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
-                    iter_count = 0
-                    time_now = time.time()
-                try:
-                    loss.mean().backward() # 反向传播计算梯度
-                    
-                except:
-                    import pdb; pdb.set_trace()
-                self.optimizer.step() # 更新模型参数
+                # 构造各层 z 嵌入列表 (对应 E_list 的时间分辨率)
+                # 粗粒度层通过 max_pool1d 降采样 Z
+                z1_list, z2_list = [Z1], [Z2]
+                z1_cur, z2_cur = Z1, Z2
+                for _ in range(n_hier - 1):
+                    # max_pool1d 作用在时间维度: [B, L, C] → [B, L//2, C]
+                    z1_cur = F.max_pool1d(
+                        z1_cur.transpose(1, 2), kernel_size=2
+                    ).transpose(1, 2)
+                    z2_cur = F.max_pool1d(
+                        z2_cur.transpose(1, 2), kernel_size=2
+                    ).transpose(1, 2)
+                    z1_list.append(z1_cur)
+                    z2_list.append(z2_cur)
 
-            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+                # ── 损失计算 ──────────────────────────────────────────────────
+                # 算法 1 步骤 18-19: L_total = L_CL + λ·L_reg (公式 4.31)
+                L_total, L_CL, L_reg = total_loss(
+                    z1_list, z2_list, E_list,
+                    dep_module=self.dep_module,
+                    M_freq=M_freq,
+                    tau_T_base=getattr(self, 'tau_T_base', 2.0),
+                    sigma=getattr(self, 'sigma', 1.0),
+                    pool_factor=2,
+                    lambda_reg=lambda_reg,
+                )
 
-            # 计算平均损失
-            train_loss = np.average(loss_list)
-            train_entropy_loss = np.average(entropy_loss_list)
-            train_rec_loss = np.average(rec_loss_list)
+                # ── 反向传播 ──────────────────────────────────────────────────
+                self.optimizer.zero_grad()
+                L_total.backward()
+                self.optimizer.step()
 
-            # valid_loss, valid_re_loss_list, valid_entropy_loss_list = self.vali(self.vali_loader)
+                loss_epoch.append(L_total.item())
 
-            valid_loss , valid_re_loss_list, valid_entropy_loss_list = self.vali(self.vali_loader)
+            # ── Epoch 结束: 验证 + 早停 + 保存 ──────────────────────────────
+            avg_train = np.mean(loss_epoch)
+            avg_vali  = self._vali()
 
-            print(
-                "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f}".format(
-                    epoch + 1, train_steps, train_loss, valid_loss))
-            print(
-                "Epoch: {0}, Steps: {1} | VALID reconstruction Loss: {3:.7f} Entropy loss Loss: {2:.7f}  ".format(
-                    epoch + 1, train_steps, valid_re_loss_list, valid_entropy_loss_list))
-            print(
-                "Epoch: {0}, Steps: {1} | TRAIN reconstruction Loss: {3:.7f} Entropy loss Loss: {2:.7f}  ".format(
-                    epoch + 1, train_steps, train_rec_loss, train_entropy_loss))
+            print(f'Epoch {epoch:3d} | '
+                  f'Train L={avg_train:.4f} | Vali L={avg_vali:.4f} | '
+                  f'Time={time.time()-t0:.1f}s')
 
-            early_stopping(valid_loss, self.model, path)
-            if early_stopping.early_stop:
-                print("Early stopping")
+            early_stop(avg_vali, self._named_modules(), self.model_save_path)
+            if early_stop.early_stop:
+                print('Early stopping triggered.')
                 break
 
+    # ─────────────────────────────────────────────────────────────────────────
+    def _vali(self) -> float:
+        """验证集上计算平均对比损失 (不做增强, 仅用于早停监控)"""
+        self.assa.eval(); self.var_emb.eval()
+        self.dep_module.eval(); self.encoder.eval()
 
-        return memory_item_embedding # 返回最终记忆嵌入（可能用于后续初始化）
-    
+        losses = []
+        n_hier = getattr(self, 'n_hier', 3)
+        with torch.no_grad():
+            for batch_x, _ in self.vali_loader:
+                x1 = batch_x.float().to(self.device)
+                x2, M_freq = self.assa(x1)
+
+                E = self.var_emb(x1)
+                E_list = [E]
+                for _ in range(n_hier - 1):
+                    E = maxpool_var_emb(E)
+                    E_list.append(E)
+
+                Z1, _ = self.encoder(x1)
+                Z2, _ = self.encoder(x2)
+                z1_list, z2_list = [Z1], [Z2]
+                z1_c, z2_c = Z1, Z2
+                for _ in range(n_hier - 1):
+                    z1_c = F.max_pool1d(z1_c.transpose(1,2), 2).transpose(1,2)
+                    z2_c = F.max_pool1d(z2_c.transpose(1,2), 2).transpose(1,2)
+                    z1_list.append(z1_c); z2_list.append(z2_c)
+
+                L, _, _ = total_loss(
+                    z1_list, z2_list, E_list, self.dep_module, M_freq,
+                    lambda_reg=getattr(self, 'lambda_reg', 0.5),
+                )
+                losses.append(L.item())
+        return float(np.mean(losses))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 算法 2: 推理与异常打分
+    # ─────────────────────────────────────────────────────────────────────────
     def test(self):
-        """模型测试函数"""
-        self.model.load_state_dict( # 加载预训练模型
-            torch.load(
-                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint_second_train.pth')))
-        self.model.eval() # 切换到评估模式 (eval)
-        
-        print("======================TEST MODE======================")
+        print('=' * 55)
+        print('  TEST MODE  —  AS2CL-AD  (Algorithm 2)')
+        print('=' * 55)
 
-        criterion = nn.MSELoss(reduce=False)  # 逐点MSE损失
-        gathering_loss = GatheringLoss(reduce=False)  # 自定义聚集损失
-        temperature = self.temperature  # softmax温度参数
+        # ── 加载 checkpoint ───────────────────────────────────────────────────
+        self._load_checkpoint()
 
-        # 训练集能量计算（用于阈值确定）
-        train_attens_energy = []
-        for i, (input_data, labels) in enumerate(self.train_loader):
-            input = input_data.float().to(self.device)
+        # ── 冻结所有参数 (含 ASSA 掩码 S) ────────────────────────────────────
+        self.assa.eval(); self.var_emb.eval()
+        self.dep_module.eval(); self.encoder.eval()
 
-            output_dict = self.model(input_data)
-            output, queries, mem_items = output_dict['out'], output_dict['queries'], output_dict['mem']
+        beta = getattr(self, 'beta', 0.5)   # 公式 4.35 融合系数
+        eps  = 1e-8
 
-            rec_loss = torch.mean(criterion(input,output),dim=-1)
-            latent_score = torch.softmax(gathering_loss(queries, mem_items)/temperature, dim=-1)
-            loss = latent_score * rec_loss
+        # 收集每个窗口的分数和标签
+        # 每个窗口产生 1 个 S_con (窗口级) 和 1 个 S_dep (窗口级)
+        s_con_all, s_dep_all, labels_all = [], [], []
 
-            cri = loss.detach().cpu().numpy()
-            train_attens_energy.append(cri)
+        with torch.no_grad():
+            for batch_x, batch_y in tqdm(self.test_loader, desc='Scoring'):
+                # x1: 原始视图  x2: ASSA 增强视图 (eval 模式不做增强, 手动调 train)
+                x1 = batch_x.float().to(self.device)   # [B, L, D]
 
-        train_attens_energy = np.concatenate(train_attens_energy, axis=0).reshape(-1)
-        train_energy = np.array(train_attens_energy)
+                # 推理阶段: 临时切换 assa 到 train 以生成增强视图
+                self.assa.train()
+                with torch.no_grad():
+                    x2, _ = self.assa(x1)
+                self.assa.eval()
 
-        # 验证集能量计算（同训练集逻辑）
-        valid_attens_energy = []
-        for i, (input_data, labels) in enumerate(self.thre_loader):
-            input = input_data.float().to(self.device)
+                B, L, D = x1.shape
 
-            output_dict = self.model(input)
-            output, queries, mem_items = output_dict['out'], output_dict['queries'], output_dict['mem']
+                # ── 步骤 03-05: 编码两视图 ────────────────────────────────────
+                # Z1, Z2: [B, L, d_proj]
+                Z1, _ = self.encoder(x1)
+                Z2, _ = self.encoder(x2)
 
-            rec_loss = torch.mean(criterion(input,output),dim=-1)
-            latent_score = torch.softmax(gathering_loss(queries, mem_items)/temperature, dim=-1)
-            loss = latent_score * rec_loss
+                # ── 步骤 07: 语义对齐分数 S_con (公式 4.32) ──────────────────
+                # 余弦距离 = 1 - cosine_similarity, 逐时间步计算
+                # z1_norm, z2_norm: [B, L, d_proj]
+                z1_n = F.normalize(Z1, p=2, dim=-1)
+                z2_n = F.normalize(Z2, p=2, dim=-1)
+                # cos_sim: [B, L]  →  S_con: [B, L]
+                cos_sim = (z1_n * z2_n).sum(dim=-1)
+                s_con_win = (1.0 - cos_sim)   # [B, L]
 
-            cri = loss.detach().cpu().numpy()
-            valid_attens_energy.append(cri)
+                # 窗口级聚合: 取时间维度均值 → [B]
+                s_con_batch = s_con_win.mean(dim=1).cpu().numpy()   # [B]
 
-        valid_attens_energy = np.concatenate(valid_attens_energy, axis=0).reshape(-1)
-        valid_energy = np.array(valid_attens_energy)
+                # ── 步骤 09-14: 依赖分布一致性分数 S_dep (公式 4.33-4.34) ────
+                # 计算原始视图和增强视图的变量嵌入
+                E1 = self.var_emb(x1)   # [B, L, D, d_emb]
+                E2 = self.var_emb(x2)   # [B, L, D, d_emb]
 
-        # 合并训练和验证能量用于阈值计算
-        combined_energy = np.concatenate([train_energy, valid_energy], axis=0)
+                # 依赖矩阵序列 A_t, A_t': [B, L, D, D]
+                A1 = self.dep_module(E1)
+                A2 = self.dep_module(E2)
 
-        # 根据异常比例计算阈值
-        thresh = np.percentile(combined_energy, 100 - self.anormly_ratio)
-        print("Threshold :", thresh)
+                # 公式 4.33: 全局依赖分布 P = (1/L)Σ A_t, Q = (1/L)Σ A_t'
+                # P, Q: [B, D, D]
+                P = A1.mean(dim=1)
+                Q = A2.mean(dim=1)
 
-        # 测试集评估
-        distance_with_q = []
-        reconstructed_output = []
-        original_output = []
-        rec_loss_list = []
+                # 公式 4.34: S_dep = Σ_i [KL(P_i||Q_i) + KL(Q_i||P_i)]
+                # 对每行 (变量 i) 计算 KL, 再对变量维度求和
+                # kl_divergence 作用在最后一维 (D), 输出 [B, D]
+                kl_pq = kl_divergence(P.clamp(eps), Q.clamp(eps), eps)  # [B, D]
+                kl_qp = kl_divergence(Q.clamp(eps), P.clamp(eps), eps)  # [B, D]
+                s_dep_batch = (kl_pq + kl_qp).sum(dim=-1).cpu().numpy()  # [B]
 
-        test_labels = []
-        test_attens_energy = []
-        # 从test_loader中测试
-        for i, (input_data, labels) in enumerate(self.test_loader):
-            input = input_data.float().to(self.device)
+                # ── 收集标签 ──────────────────────────────────────────────────
+                # batch_y: [B, L] 或 [B]
+                y = batch_y.numpy()
+                if y.ndim == 2:
+                    # 窗口内任意时间步为异常则窗口标记为异常
+                    y = (y.max(axis=1) > 0).astype(int)
+                labels_all.append(y.reshape(-1))
+                s_con_all.append(s_con_batch)
+                s_dep_all.append(s_dep_batch)
 
-            output_dict= self.model(input)
+        # ── 拼接为一维 numpy 数组 ─────────────────────────────────────────────
+        s_con   = np.concatenate(s_con_all,  axis=0)   # [N_windows]
+        s_dep   = np.concatenate(s_dep_all,  axis=0)   # [N_windows]
+        gt      = np.concatenate(labels_all, axis=0).astype(int)
 
-            # 获取输出
-            output, queries, mem_items = output_dict['out'], output_dict['queries'], output_dict['mem']
+        # ── 步骤 15: 公式 4.35 融合 ───────────────────────────────────────────
+        s_con_n = minmax_norm(s_con)
+        s_dep_n = minmax_norm(s_dep)
+        score   = beta * s_con_n + (1.0 - beta) * s_dep_n   # [N_windows]
 
+        # ── 阈值: 按异常比例百分位 ────────────────────────────────────────────
+        thresh = np.percentile(score, 100 - self.anormly_ratio)
+        pred   = (score >= thresh).astype(int)
 
-            # 计算各项指标
-            rec_loss = torch.mean(criterion(input,output),dim=-1)
-            latent_score = torch.softmax(gathering_loss(queries, mem_items)/temperature, dim=-1)
+        print(f'  Threshold = {thresh:.4f}  '
+              f'(anormly_ratio={self.anormly_ratio}%)')
+        print(f'  pred shape: {pred.shape},  gt shape: {gt.shape}')
 
-            # print('22ewaeasflatensoreone', i, latent_score.shape)
-            loss = latent_score * rec_loss
-            cri = loss.detach().cpu().numpy()
-
-            # 记录数据
-            test_attens_energy.append(cri)
-            test_labels.append(labels)
-
-            d_q = gathering_loss(queries, mem_items)*rec_loss
-            distance_with_q.append(d_q.detach().cpu().numpy())
-            distance_with_q.append(gathering_loss(queries, mem_items).detach().cpu().numpy())
-
-            reconstructed_output.append(output.detach().cpu().numpy())
-            original_output.append(input.detach().cpu().numpy())
-            rec_loss_list.append(rec_loss.detach().cpu().numpy())
-
-        test_attens_energy = np.concatenate(test_attens_energy, axis=0).reshape(-1)
-        test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
-        test_energy = np.array(test_attens_energy)
-        test_labels = np.array(test_labels)
-
-        reconstructed_output = np.concatenate(reconstructed_output,axis=0).reshape(-1)
-        original_output = np.concatenate(original_output,axis=0).reshape(-1)
-        rec_loss_list = np.concatenate(rec_loss_list,axis=0).reshape(-1)
-
-
-        #reconstruct_path = f"./hyperparameters_tuning/reconstruction/{self.dataset}_"
-        #np.save(reconstruct_path+'reconstructed_output', reconstructed_output)
-        #np.save(reconstruct_path+'original_output', original_output)
-        #np.save(reconstruct_path+'rec_loss',rec_loss_list)
-        #np.save(reconstruct_path+'gt_labels',test_labels)
-        #np.save(reconstruct_path+'anomaly_score_only_gathering_loss',test_energy)
-        
-        distance_with_q = np.concatenate(distance_with_q,axis=0).reshape(-1)
-
-        normal_dist = []
-        abnormal_dist = []
-        for i,l in enumerate(test_labels):
-            if l == 0:
-                normal_dist.append(distance_with_q[i])
-            else:
-                abnormal_dist.append(distance_with_q[i])
-
-        #dist_path = f"./hyperparameters_tuning/norm_abnorm_distribtuion/{self.dataset}_"
-        #normal_dist = np.array(normal_dist)
-        #abnormal_dist = np.array(abnormal_dist)
-
-        #np.save(dist_path+'normal_dist_only_gl', normal_dist)
-        #np.save(dist_path+'abnormal_dist_only_gl', abnormal_dist)
-
-
-        # 生成预测结果（基于阈值）
-        pred = (test_energy > thresh).astype(int)
-
-        gt = test_labels.astype(int)
-
-        # pred_df = pd.DataFrame(pred)
-        # # 保存到CSV文件
-        # pred_df.to_csv('Suspected_abnormality.csv', index=False)
-        #
-        # print("pred 已成功保存到 Suspected_abnormality.csv 文件中")
-
-        print("pred:   ", pred.shape)
-        print("gt:     ", gt.shape)
-
-        # 12.2增加
-        # matrix = [self.index]
-        # scores_simple = combine_all_evaluation_scores(pred, gt, test_energy)
-        # for key, value in scores_simple.items():
-        #     matrix.append(value)
-        #     print('{0:21} : {1:0.4f}'.format(key, value))
-
+        # ── Point-Adjust (PA) 后处理 ──────────────────────────────────────────
+        pred_pa = pred.copy()
         anomaly_state = False
         for i in range(len(gt)):
-            if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
+            if gt[i] == 1 and pred_pa[i] == 1 and not anomaly_state:
                 anomaly_state = True
                 for j in range(i, 0, -1):
                     if gt[j] == 0:
                         break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
+                    pred_pa[j] = 1
                 for j in range(i, len(gt)):
                     if gt[j] == 0:
                         break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
+                    pred_pa[j] = 1
             elif gt[i] == 0:
                 anomaly_state = False
             if anomaly_state:
-                pred[i] = 1
+                pred_pa[i] = 1
+
+        # ── 评价指标计算 ──────────────────────────────────────────────────────
+        self._evaluate(score, pred_pa, gt)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    def _evaluate(self, score: np.ndarray, pred: np.ndarray, gt: np.ndarray):
+        """计算并打印所有评价指标 (对应论文表 4.2 / 4.3)"""
+        eps = 1e-8
+
+        # 1. 基础指标
+        acc = accuracy_score(gt, pred)
+        prec, rec, f1, _ = precision_recall_fscore_support(
+            gt, pred, average='binary', zero_division=0
+        )
+
+        # 2. AUC-ROC / AUC-PR (基于连续分数)
+        try:
+            auc_roc = roc_auc_score(gt, score)
+        except ValueError:
+            auc_roc = float('nan')
+        try:
+            auc_pr = average_precision_score(gt, score)
+        except ValueError:
+            auc_pr = float('nan')
+
+        # 3. Affiliation F-score (Aff-F)
+        try:
+            events_pred = convert_vector_to_events(pred)
+            events_gt   = convert_vector_to_events(gt)
+            Trange      = (0, len(gt))
+            aff         = pr_from_events(events_pred, events_gt, Trange)
+            aff_p  = aff['precision']
+            aff_r  = aff['recall']
+            aff_f  = 2 * aff_p * aff_r / (aff_p + aff_r + eps)
+        except Exception as e:
+            aff_p = aff_r = aff_f = float('nan')
+            print(f'  [WARN] Affiliation metric failed: {e}')
+
+        # ── 表格输出 ──────────────────────────────────────────────────────────
+        sep = '-' * 55
+        print(sep)
+        print(f'  Dataset : {self.dataset}')
+        print(sep)
+        print(f'  {"Metric":<22} {"Value":>10}')
+        print(sep)
+        print(f'  {"Accuracy":<22} {acc:>10.4f}')
+        print(f'  {"Precision":<22} {prec:>10.4f}')
+        print(f'  {"Recall":<22} {rec:>10.4f}')
+        print(f'  {"F1":<22} {f1:>10.4f}')
+        print(f'  {"Aff-Precision":<22} {aff_p:>10.4f}')
+        print(f'  {"Aff-Recall":<22} {aff_r:>10.4f}')
+        print(f'  {"Aff-F (Aff-F)":<22} {aff_f:>10.4f}')
+        print(f'  {"AUC-ROC (A-ROC)":<22} {auc_roc:>10.4f}')
+        print(f'  {"AUC-PR  (A-PR)":<22} {auc_pr:>10.4f}')
+        print(sep)
+        print(f'  [Summary] F1={f1:.4f} | Aff-F={aff_f:.4f} | '
+              f'A-ROC={auc_roc:.4f} | A-PR={auc_pr:.4f}')
+        print(sep)
+
+        self.logger.info(
+            f'{self.dataset} | F1={f1:.4f} Aff-F={aff_f:.4f} '
+            f'A-ROC={auc_roc:.4f} A-PR={auc_pr:.4f}'
+        )
+        return {'f1': f1, 'aff_f': aff_f, 'auc_roc': auc_roc, 'auc_pr': auc_pr}
 
 
-        pred = np.array(pred)
-        gt = np.array(gt)
-        print("pred: ", pred.shape)
-        print("gt:   ", gt.shape)
 
-
-
-        # 计算评估指标
-        accuracy = accuracy_score(gt, pred)
-        precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
-                                                                            average='binary')
-        print("Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(accuracy, precision, recall, f_score))
-        print('='*50)
-
-        self.logger.info(f"Dataset: {self.dataset}")
-        self.logger.info(f"number of items: {self.n_memory}")
-        self.logger.info(f"Precision: {round(precision,4)}")
-        self.logger.info(f"Recall: {round(recall,4)}")
-        self.logger.info(f"f1_score: {round(f_score,4)} \n")
-        return accuracy, precision, recall, f_score
-
-    def get_memory_initial_embedding(self,training_type='second_train'):
-
-        self.model.load_state_dict(
-            torch.load(
-                os.path.join(str(self.model_save_path), str(self.dataset) + '_checkpoint_first_train.pth')))
-        self.model.eval()
-        
-        for i, (input_data, labels) in enumerate(self.k_loader):
-
-            input = input_data.float().to(self.device)
-            if i==0:
-                output= self.model(input)['queries']
-            else:
-                output = torch.cat([output,self.model(input)['queries']], dim=0)
-        
-        self.memory_init_embedding = k_means_clustering(x=output, n_mem=self.n_memory, d_model=self.d_model)
-
-        self.memory_initial = False
-
-        self.build_model(memory_init_embedding = self.memory_init_embedding.detach())
-
-        memory_item_embedding = self.train(training_type=training_type)
-
-        memory_item_embedding = memory_item_embedding[:int(self.n_memory),:]
-
-        print(memory_item_embedding.shape)
-
-        item_folder_path = "memory_item"
-        if not os.path.exists(item_folder_path):
-            os.makedirs(item_folder_path)
-
-        item_path = os.path.join(item_folder_path, str(self.dataset) + '_memory_item.pth')
-
-        torch.save(memory_item_embedding, item_path)

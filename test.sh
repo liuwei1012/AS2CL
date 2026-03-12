@@ -79,3 +79,10 @@ python main.py --anormly_ratio 2.0 --num_epochs 100   --batch_size 16  --mode te
 
 
 
+# PSM test 3
+python main.py --anormly_ratio 1.0 --num_epochs 3 --batch_size 4 --mode train --dataset PSM --data_path ./data/PSM/PSM/ --input_c 25 --lambd 0.01 --lr 1e-4
+
+python main.py --anormly_ratio 1.0 --num_epochs 2  --batch_size 64  --mode memory_initial --dataset PSM  --data_path ./data/PSM/PSM/  --input_c 25 --output_c 25 --n_memory 10 --lambd 0.01 --lr 5e-5 --memory_initial True --phase_type second_train
+
+# # test
+python main.py --anormly_ratio 1.0 --num_epochs 3   --batch_size 64  --mode test --dataset PSM  --data_path ./data/PSM/PSM/  --input_c 25

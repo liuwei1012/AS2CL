@@ -352,52 +352,54 @@ class Solver:
                 Z2, _ = self.encoder(x2)
 
                 # ── 步骤 07: 语义对齐分数 S_con (公式 4.32) ──────────────────
-                # 余弦距离 = 1 - cosine_similarity, 逐时间步计算
-                # z1_norm, z2_norm: [B, L, d_proj]
+                # 逐时间步计算余弦距离, 保留时间维度
+                # Z1, Z2: [B, L, d_proj]
                 z1_n = F.normalize(Z1, p=2, dim=-1)
                 z2_n = F.normalize(Z2, p=2, dim=-1)
-                # cos_sim: [B, L]  →  S_con: [B, L]
-                cos_sim = (z1_n * z2_n).sum(dim=-1)
-                s_con_win = (1.0 - cos_sim)   # [B, L]
-
-                # 窗口级聚合: 取时间维度均值 → [B]
-                s_con_batch = s_con_win.mean(dim=1).cpu().numpy()   # [B]
+                # s_con_win: [B, L]  每个时间步的语义对齐分数
+                s_con_win = (1.0 - (z1_n * z2_n).sum(dim=-1))   # [B, L]
 
                 # ── 步骤 09-14: 依赖分布一致性分数 S_dep (公式 4.33-4.34) ────
-                # 计算原始视图和增强视图的变量嵌入
                 E1 = self.var_emb(x1)   # [B, L, D, d_emb]
                 E2 = self.var_emb(x2)   # [B, L, D, d_emb]
 
-                # 依赖矩阵序列 A_t, A_t': [B, L, D, D]
+                # 逐时间步依赖矩阵: [B, L, D, D]
                 A1 = self.dep_module(E1)
                 A2 = self.dep_module(E2)
 
-                # 公式 4.33: 全局依赖分布 P = (1/L)Σ A_t, Q = (1/L)Σ A_t'
-                # P, Q: [B, D, D]
+                # 公式 4.33: 全局依赖分布 P, Q: [B, D, D]
                 P = A1.mean(dim=1)
                 Q = A2.mean(dim=1)
 
-                # 公式 4.34: S_dep = Σ_i [KL(P_i||Q_i) + KL(Q_i||P_i)]
-                # 对每行 (变量 i) 计算 KL, 再对变量维度求和
-                # kl_divergence 作用在最后一维 (D), 输出 [B, D]
+                # 公式 4.34: 对称 KL 散度, 对变量维度求和 → 窗口级标量 [B]
+                # 再广播到时间维度, 使每个时间步共享同一窗口的 S_dep
                 kl_pq = kl_divergence(P.clamp(eps), Q.clamp(eps), eps)  # [B, D]
                 kl_qp = kl_divergence(Q.clamp(eps), P.clamp(eps), eps)  # [B, D]
-                s_dep_batch = (kl_pq + kl_qp).sum(dim=-1).cpu().numpy()  # [B]
+                s_dep_scalar = (kl_pq + kl_qp).sum(dim=-1)              # [B]
+                # 扩展到 [B, L], 窗口内每个时间步共享同一 S_dep 值
+                s_dep_win = s_dep_scalar.unsqueeze(1).expand(-1, L)      # [B, L]
 
-                # ── 收集标签 ──────────────────────────────────────────────────
-                # batch_y: [B, L] 或 [B]
+                # ── 展平为时间点序列 [B*L] ────────────────────────────────────
+                # s_con_win, s_dep_win: [B, L] → reshape [B*L]
+                s_con_all.append(s_con_win.cpu().numpy().reshape(-1))    # [B*L]
+                s_dep_all.append(s_dep_win.cpu().numpy().reshape(-1))    # [B*L]
+
+                # ── 收集标签: 保持逐时间步 ────────────────────────────────────
+                # batch_y: [B, L] (数据集返回每个时间步的标签)
                 y = batch_y.numpy()
-                if y.ndim == 2:
-                    # 窗口内任意时间步为异常则窗口标记为异常
-                    y = (y.max(axis=1) > 0).astype(int)
-                labels_all.append(y.reshape(-1))
-                s_con_all.append(s_con_batch)
-                s_dep_all.append(s_dep_batch)
+                if y.ndim == 1:
+                    # 若 DataLoader 只返回窗口级标签 [B], 广播到 [B*L]
+                    y = np.repeat(y, L)
+                else:
+                    # [B, L] → [B*L]
+                    y = y.reshape(-1)
+                labels_all.append(y)
 
-        # ── 拼接为一维 numpy 数组 ─────────────────────────────────────────────
-        s_con   = np.concatenate(s_con_all,  axis=0)   # [N_windows]
-        s_dep   = np.concatenate(s_dep_all,  axis=0)   # [N_windows]
-        gt      = np.concatenate(labels_all, axis=0).astype(int)
+        # ── 拼接为一维 numpy 数组 (时间点级) ────────────────────────────────
+        # 每个窗口贡献 B*L 个时间点, 最终长度 ≈ N_test_timesteps
+        s_con   = np.concatenate(s_con_all,  axis=0)   # [N_timesteps]
+        s_dep   = np.concatenate(s_dep_all,  axis=0)   # [N_timesteps]
+        gt      = np.concatenate(labels_all, axis=0).astype(int)  # [N_timesteps]
 
         # ── 步骤 15: 公式 4.35 融合 ───────────────────────────────────────────
         s_con_n = minmax_norm(s_con)

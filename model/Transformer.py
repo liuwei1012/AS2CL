@@ -92,6 +92,84 @@ class Decoder(nn.Module):
         return out      # N x L x c_out
 
 
+class ProjectionHead(nn.Module):
+    """
+    投影头 (论文 4.2.2 节, 图 4.4, 公式 4.13/4.14)
+
+    将编码器输出 H ∈ R^{L × d_model} 映射到对比学习的潜在空间 Z。
+    结构: Linear → ReLU → Linear
+    两个视图共享同一投影头权重 (连体网络)。
+
+    输入:  H [B, L, d_model]
+    输出:  Z [B, L, d_proj]
+    """
+    def __init__(self, d_model: int, d_proj: int, dropout: float = 0.0):
+        super(ProjectionHead, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, d_model),   # 第一个线性层
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
+            nn.Linear(d_model, d_proj),    # 第二个线性层
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: [B, L, d_model]  →  Z: [B, L, d_proj]
+        return self.net(h)
+
+
+class AS2CLAD_Encoder(nn.Module):
+    """
+    AS2CL-AD 特征提取主干 (论文 4.2.2 节)
+
+    流程: InputEmbedding → Transformer Encoder (N 层) → ProjectionHead
+    两个增强视图共享全部权重 (连体结构)。
+
+    输入:  x  [B, L, D]
+    输出:  Z  [B, L, d_proj]   对比学习潜在特征
+           H  [B, L, d_model]  编码器原始输出 (供依赖模式模块使用)
+    """
+    def __init__(self, win_size: int, enc_in: int, d_model: int = 512,
+                 n_heads: int = 8, e_layers: int = 3, d_ff: int = 512,
+                 d_proj: int = 128, dropout: float = 0.0,
+                 activation: str = 'gelu', device=None):
+        super(AS2CLAD_Encoder, self).__init__()
+
+        self.embedding = InputEmbedding(
+            in_dim=enc_in, d_model=d_model, dropout=dropout, device=device
+        )
+
+        self.encoder = Encoder(
+            [
+                EncoderLayer(
+                    AttentionLayer(win_size, d_model, n_heads, dropout=dropout),
+                    d_model, d_ff, dropout=dropout, activation=activation
+                ) for _ in range(e_layers)
+            ],
+            norm_layer=nn.LayerNorm(d_model)
+        )
+
+        # 共享投影头 (公式 4.13 / 4.14)
+        self.proj_head = ProjectionHead(d_model=d_model, d_proj=d_proj, dropout=dropout)
+
+    def forward(self, x: torch.Tensor):
+        """
+        x: [B, L, D]
+        返回:
+            Z: [B, L, d_proj]   投影后的潜在特征, 用于对比损失
+            H: [B, L, d_model]  编码器输出, 用于依赖模式矩阵计算
+        """
+        # 实例归一化 (Non-stationary Transformer 风格)
+        means = x.mean(1, keepdim=True).detach()
+        x = x - means
+        stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x = x / stdev
+
+        E = self.embedding(x)          # [B, L, d_model]
+        H = self.encoder(E)            # [B, L, d_model]
+        Z = self.proj_head(H)          # [B, L, d_proj]
+        return Z, H
+
+
 class TransformerVar(nn.Module):
     # ours: shrink_thres=0.0025
     def __init__(self, win_size, enc_in, c_out, n_memory, shrink_thres=0, \
@@ -160,3 +238,22 @@ class TransformerVar(nn.Module):
             enc_in == c_out
             '''
             return {"out":out, "memory_item_embedding":memory_item_embedding, "queries":queries, "mem":mem, "attn":attn}
+
+
+if __name__ == '__main__':
+    B, L, D = 4, 100, 12
+    d_model, d_proj = 512, 128
+    x = torch.randn(B, L, D)
+
+    model = AS2CLAD_Encoder(
+        win_size=L, enc_in=D, d_model=d_model, n_heads=8,
+        e_layers=3, d_ff=512, d_proj=d_proj, dropout=0.0
+    )
+    model.eval()
+    with torch.no_grad():
+        Z, H = model(x)
+
+    print(f"[AS2CLAD_Encoder]")
+    print(f"  input  x : {x.shape}")    # [4, 100, 12]
+    print(f"  encoder H: {H.shape}")    # [4, 100, 512]
+    print(f"  proj    Z: {Z.shape}")    # [4, 100, 128]

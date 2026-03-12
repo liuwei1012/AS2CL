@@ -67,3 +67,75 @@ class AttentionLayer(nn.Module):
 
         return self.out_proj(out)   # N x L x C(=d_model)
 
+
+class DependencyPatternModule(nn.Module):
+    """
+    动态变量依赖模式矩阵 (论文 4.2.4 节, 公式 4.16 / 4.17)
+
+    对每个时间步 t, 利用变量嵌入 E_t ∈ R^{D × d_emb} 通过共享的 Q/K 投影
+    计算 D×D 的注意力矩阵 A_t, 描述变量间的瞬时依赖强度。
+
+    输入:  E  [B, T, D, d_emb]   变量独立解耦嵌入 (来自 VariableIndependentEmbedding)
+    输出:  A  [B, T, D, D]       动态依赖模式序列
+               A[b, t, i, j] 表示时刻 t 变量 j 对变量 i 的依赖强度
+    """
+
+    def __init__(self, d_emb: int, dropout: float = 0.0):
+        """
+        Args:
+            d_emb:   变量嵌入维度 (与 VariableIndependentEmbedding 的 d_emb 一致)
+            dropout: 注意力 Dropout 概率
+        """
+        super(DependencyPatternModule, self).__init__()
+        self.d_emb = d_emb
+        self.scale = 1.0 / math.sqrt(d_emb)
+
+        # 共享的可学习投影矩阵 W^Q, W^K (公式 4.16)
+        # 在所有时间步 t 上共享
+        self.W_Q = nn.Linear(d_emb, d_emb, bias=False)
+        self.W_K = nn.Linear(d_emb, d_emb, bias=False)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, E: torch.Tensor) -> torch.Tensor:
+        """
+        E: [B, T, D, d_emb]
+        返回 A: [B, T, D, D]
+        """
+        # ── 公式 4.16: Q_t = E_t W^Q,  K_t = E_t W^K ──────────────────────
+        # W_Q / W_K 作用在最后一维 d_emb 上, 对 B 和 T 维度自动广播
+        Q = self.W_Q(E)   # [B, T, D, d_emb]
+        K = self.W_K(E)   # [B, T, D, d_emb]
+
+        # ── 公式 4.17: A_t = Softmax(Q_t K_t^T / sqrt(d_emb)) ─────────────
+        # Q @ K^T: [B, T, D, d_emb] × [B, T, d_emb, D] → [B, T, D, D]
+        scores = torch.matmul(Q, K.transpose(-1, -2)) * self.scale  # [B, T, D, D]
+
+        # Softmax 沿最后一维 (key 维度), 使每行和为 1
+        A = self.dropout(torch.softmax(scores, dim=-1))              # [B, T, D, D]
+        return A
+
+
+if __name__ == '__main__':
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+    from model.embedding import VariableIndependentEmbedding
+
+    B, T, D, d_emb = 4, 100, 12, 64
+    x = torch.randn(B, T, D)
+
+    # Step 1: 变量独立嵌入
+    emb_model = VariableIndependentEmbedding(n_vars=D, d_emb=d_emb)
+    E = emb_model(x)                          # [4, 100, 12, 64]
+    print(f"[Embedding]  E shape : {E.shape}")
+
+    # Step 2: 动态依赖模式矩阵
+    dep_model = DependencyPatternModule(d_emb=d_emb)
+    A = dep_model(E)                          # [4, 100, 12, 12]
+    print(f"[DepPattern] A shape : {A.shape}")
+
+    # 验证: A 在最后一维 (key 维) 上的和为 1 (Softmax 性质)
+    row_sums = A.sum(dim=-1)                  # [4, 100, 12]
+    assert torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-5), \
+        f"Softmax 行和不为 1! max_err={( row_sums - 1).abs().max().item():.2e}"
+    print(f"[DepPattern] Softmax row-sum check passed: all sums ~= 1.0")
+

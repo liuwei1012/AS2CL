@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import torch; print\\(torch.__version__\\)\" 2>&1)",
+      "Bash(where python:*)",
+      "Bash(conda run:*)",
+      "Read(//c/Users//**)",
+      "Read(//mnt/c/**)",
+      "Bash(/d/software/miniconda3/envs/TS/python.exe autoaug/fourier.py 2>&1)",
+      "Bash(/d/software/miniconda3/envs/TS/python.exe model/embedding.py 2>&1)",
+      "Bash(/d/software/miniconda3/envs/TS/python.exe -m py_compile model/embedding.py 2>&1 && echo \"✓ embedding.py 语法正确\")",
+      "Bash(cd E:/contrastive/AS2CL-AD && /d/software/miniconda3/python.exe -m py_compile model/Transformer.py 2>&1 && echo \"✓ Transformer.py OK\" && /d/software/miniconda3/python.exe -m py_compile model/attn_layer.py 2>&1 && echo \"✓ attn_layer.py OK\")",
+      "Bash(cd E:/contrastive/AS2CL-AD && /d/software/miniconda3/python.exe model/attn_layer.py 2>&1)",
+      "Bash(cd E:/contrastive/AS2CL-AD && /d/software/miniconda3/python.exe model/Transformer.py 2>&1)",
+      "Bash(cd E:/contrastive/AS2CL-AD && /d/software/miniconda3/python.exe -c \"\nimport sys, types\nsys.path.insert\\(0, '.'\\)\npkg = types.ModuleType\\('model'\\); pkg.__path__ = ['model']\nsys.modules['model'] = pkg\n\nfrom model.Transformer import AS2CLAD_Encoder\nimport torch\n\nB, L, D = 4, 100, 12\nx = torch.randn\\(B, L, D\\)\nmodel = AS2CLAD_Encoder\\(win_size=L, enc_in=D, d_model=512, n_heads=8,\n                         e_layers=3, d_ff=512, d_proj=128, dropout=0.0\\)\nmodel.eval\\(\\)\nwith torch.no_grad\\(\\):\n    Z, H = model\\(x\\)\nprint\\(f'input  x : {x.shape}'\\)\nprint\\(f'encoder H: {H.shape}'\\)\nprint\\(f'proj    Z: {Z.shape}'\\)\n\" 2>&1)"
+    ]
+  }
+}

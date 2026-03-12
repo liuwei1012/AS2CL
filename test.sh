@@ -26,8 +26,8 @@ python main.py --anormly_ratio 0.04 --num_epochs 100   --batch_size 32  --mode t
 
 
 # PSM test 3
-python main.py --anormly_ratio 1.0 --num_epochs 3 --batch_size 4 --mode train --dataset PSM --data_path ./data/PSM/PSM/ --input_c 25 --lambd 0.01 --lr 1e-4
+python main.py --anormly_ratio 1.0 --num_epochs 2 --batch_size 16 --mode train --dataset PSM --data_path ./data/PSM/PSM/ --input_c 25 --lambd 0.01 --lr 1e-4
 
 # # test
 
-python main.py --anormly_ratio 1.0 --num_epochs 3   --batch_size 64  --mode test --dataset PSM  --data_path ./data/PSM/PSM/  --input_c 25
+python main.py --anormly_ratio 1.0 --num_epochs 10   --batch_size 16  --mode test --dataset PSM  --data_path ./data/PSM/PSM/  --input_c 25

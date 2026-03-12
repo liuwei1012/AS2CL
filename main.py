@@ -74,7 +74,7 @@ if __name__ == '__main__':
                         help='ASSA 高斯噪声标准差')
 
     # ── 软对比超参数 ──────────────────────────────────────────────────────────
-    parser.add_argument('--tau_T_base', type=float, default=2.0,
+    parser.add_argument('--tau_T_base', type=float, default=8.0,
                         help='时间邻近性基础温度 τ̃_T (公式 4.25)')
     parser.add_argument('--sigma',      type=float, default=1.0,
                         help='依赖一致性高斯核带宽 σ (公式 4.20)')

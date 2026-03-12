@@ -99,6 +99,7 @@ class Solver:
         # ── 数据加载 ──────────────────────────────────────────────────────────
         self.train_loader, self.vali_loader, _ = get_loader_segment(
             self.data_path, batch_size=self.batch_size,
+            step=1,
             win_size=self.win_size, mode='train', dataset=self.dataset
         )
         self.test_loader, _ = get_loader_segment(
@@ -212,46 +213,25 @@ class Solver:
                 # 训练模式下 assa 返回增强视图; M_freq 用于 L_reg
                 x2, M_freq = self.assa(x1)   # x2: [B,L,D], M_freq: [F]
 
-                # ── 变量独立嵌入 → 层次化依赖模式 ────────────────────────────
-                # 算法 1 步骤 06-08: 计算 E_dec 和 W_DC
-                # E: [B, L, D, d_emb]
+                # ── 变量独立嵌入 (算法 1 步骤 06) ────────────────────────────
+                # E: [B, L, D, d_emb]  — 层次化池化在 total_loss 内部自动完成
                 E = self.var_emb(x1)
 
-                # 构造层次化嵌入列表 (公式 4.21 MaxPool)
-                E_list = [E]
-                for _ in range(n_hier - 1):
-                    E = maxpool_var_emb(E)
-                    E_list.append(E)
-
-                # ── Transformer 编码 + 投影头 ─────────────────────────────────
-                # 算法 1 步骤 09-17: 两视图共享编码器权重
-                # Z: [B, L, d_proj]  H: [B, L, d_model]
+                # ── Transformer 编码 + 投影头 (算法 1 步骤 09-17) ─────────────
+                # Z1, Z2: [B, L, d_proj]
                 Z1, _ = self.encoder(x1)
                 Z2, _ = self.encoder(x2)
 
-                # 构造各层 z 嵌入列表 (对应 E_list 的时间分辨率)
-                # 粗粒度层通过 max_pool1d 降采样 Z
-                z1_list, z2_list = [Z1], [Z2]
-                z1_cur, z2_cur = Z1, Z2
-                for _ in range(n_hier - 1):
-                    # max_pool1d 作用在时间维度: [B, L, C] → [B, L//2, C]
-                    z1_cur = F.max_pool1d(
-                        z1_cur.transpose(1, 2), kernel_size=2
-                    ).transpose(1, 2)
-                    z2_cur = F.max_pool1d(
-                        z2_cur.transpose(1, 2), kernel_size=2
-                    ).transpose(1, 2)
-                    z1_list.append(z1_cur)
-                    z2_list.append(z2_cur)
-
-                # ── 损失计算 ──────────────────────────────────────────────────
-                # 算法 1 步骤 18-19: L_total = L_CL + λ·L_reg (公式 4.31)
+                # ── 损失计算 (算法 1 步骤 18-19) ──────────────────────────────
+                # total_loss 内部自动循环 MaxPool 直到 T=1
+                # 层数 = floor(log2(L))+1, 例如 L=100 → 7 层
                 L_total, L_CL, L_reg = total_loss(
-                    z1_list, z2_list, E_list,
+                    Z1, Z2, E,
                     dep_module=self.dep_module,
                     M_freq=M_freq,
                     tau_T_base=getattr(self, 'tau_T_base', 2.0),
                     sigma=getattr(self, 'sigma', 1.0),
+                    tau_w=getattr(self, 'tau_w', 1.0),
                     pool_factor=2,
                     lambda_reg=lambda_reg,
                 )
@@ -290,22 +270,13 @@ class Solver:
                 x2, M_freq = self.assa(x1)
 
                 E = self.var_emb(x1)
-                E_list = [E]
-                for _ in range(n_hier - 1):
-                    E = maxpool_var_emb(E)
-                    E_list.append(E)
-
                 Z1, _ = self.encoder(x1)
                 Z2, _ = self.encoder(x2)
-                z1_list, z2_list = [Z1], [Z2]
-                z1_c, z2_c = Z1, Z2
-                for _ in range(n_hier - 1):
-                    z1_c = F.max_pool1d(z1_c.transpose(1,2), 2).transpose(1,2)
-                    z2_c = F.max_pool1d(z2_c.transpose(1,2), 2).transpose(1,2)
-                    z1_list.append(z1_c); z2_list.append(z2_c)
-
                 L, _, _ = total_loss(
-                    z1_list, z2_list, E_list, self.dep_module, M_freq,
+                    Z1, Z2, E, self.dep_module, M_freq,
+                    tau_T_base=getattr(self, 'tau_T_base', 2.0),
+                    sigma=getattr(self, 'sigma', 1.0),
+                    tau_w=getattr(self, 'tau_w', 1.0),
                     lambda_reg=getattr(self, 'lambda_reg', 0.5),
                 )
                 losses.append(L.item())

@@ -9,9 +9,9 @@ python main.py --anormly_ratio 1.0 --num_epochs 100   --batch_size 64  --mode te
 
 # # MSL
 
-# python main.py --anormly_ratio 1.0 --num_epochs 100 --batch_size 256 --mode train --dataset MSL --data_path ./data/MSL/MSL/ --input_c 55 --output_c 55 --n_memory 10 --lambd 0.01 --lr 1e-4 --memory_initial False --phase_type None
+python main.py --anormly_ratio 1.0 --num_epochs 2 --batch_size 8 --mode train --dataset MSL --data_path ./data/MSL/MSL/ --input_c 55 --lambd 0.01 --lr 1e-4
 # # test
-python main.py --anormly_ratio 1.0 --num_epochs 10   --batch_size 256  --mode test --dataset MSL  --data_path ./data/MSL/MSL/  --input_c 55 --output_c 55 --n_memory 10 --memory_initial False --phase_type test
+python main.py --anormly_ratio 1.0 --num_epochs 10   --batch_size 16  --mode test --dataset MSL  --data_path ./data/MSL/MSL/  --input_c 55
 
 
 
@@ -26,7 +26,7 @@ python main.py --anormly_ratio 0.04 --num_epochs 100   --batch_size 32  --mode t
 
 
 # PSM test 3
-python main.py --anormly_ratio 1.0 --num_epochs 2 --batch_size 16 --mode train --dataset PSM --data_path ./data/PSM/PSM/ --input_c 25 --lambd 0.01 --lr 1e-4
+python main.py --anormly_ratio 1.0 --num_epochs 2 --batch_size 8 --mode train --dataset PSM --data_path ./data/PSM/PSM/ --input_c 25 --lambd 0.01 --lr 1e-4
 
 # # test
 

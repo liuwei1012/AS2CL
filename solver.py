@@ -11,12 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import (
-    precision_recall_fscore_support,
-    accuracy_score,
-    roc_auc_score,
-    average_precision_score,
-)
 from tqdm import tqdm
 
 from data_factory.data_loader import get_loader_segment
@@ -34,9 +28,7 @@ from model.dependency_soft_cl import (                    # 层次化软对比�
 )
 
 # ── 评价指标 ─────────────────────────────────────────────────────────────────
-from metrics.affiliation.generics import convert_vector_to_events
-from metrics.affiliation.metrics import pr_from_events
-from metrics.AUC import point_wise_AUC
+from metrics.combine_all_scores import combine_all_evaluation_scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,7 +91,6 @@ class Solver:
         # ── 数据加载 ──────────────────────────────────────────────────────────
         self.train_loader, self.vali_loader, _ = get_loader_segment(
             self.data_path, batch_size=self.batch_size,
-            step=1,
             win_size=self.win_size, mode='train', dataset=self.dataset
         )
         self.test_loader, _ = get_loader_segment(
@@ -405,68 +396,7 @@ class Solver:
                 pred_pa[i] = 1
 
         # ── 评价指标计算 ──────────────────────────────────────────────────────
-        self._evaluate(score, pred_pa, gt)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    def _evaluate(self, score: np.ndarray, pred: np.ndarray, gt: np.ndarray):
-        """计算并打印所有评价指标 (对应论文表 4.2 / 4.3)"""
-        eps = 1e-8
-
-        # 1. 基础指标
-        acc = accuracy_score(gt, pred)
-        prec, rec, f1, _ = precision_recall_fscore_support(
-            gt, pred, average='binary', zero_division=0
-        )
-
-        # 2. AUC-ROC / AUC-PR (基于连续分数)
-        try:
-            auc_roc = roc_auc_score(gt, score)
-        except ValueError:
-            auc_roc = float('nan')
-        try:
-            auc_pr = average_precision_score(gt, score)
-        except ValueError:
-            auc_pr = float('nan')
-
-        # 3. Affiliation F-score (Aff-F)
-        try:
-            events_pred = convert_vector_to_events(pred)
-            events_gt   = convert_vector_to_events(gt)
-            Trange      = (0, len(gt))
-            aff         = pr_from_events(events_pred, events_gt, Trange)
-            aff_p  = aff['precision']
-            aff_r  = aff['recall']
-            aff_f  = 2 * aff_p * aff_r / (aff_p + aff_r + eps)
-        except Exception as e:
-            aff_p = aff_r = aff_f = float('nan')
-            print(f'  [WARN] Affiliation metric failed: {e}')
-
-        # ── 表格输出 ──────────────────────────────────────────────────────────
-        sep = '-' * 55
-        print(sep)
-        print(f'  Dataset : {self.dataset}')
-        print(sep)
-        print(f'  {"Metric":<22} {"Value":>10}')
-        print(sep)
-        print(f'  {"Accuracy":<22} {acc:>10.4f}')
-        print(f'  {"Precision":<22} {prec:>10.4f}')
-        print(f'  {"Recall":<22} {rec:>10.4f}')
-        print(f'  {"F1":<22} {f1:>10.4f}')
-        print(f'  {"Aff-Precision":<22} {aff_p:>10.4f}')
-        print(f'  {"Aff-Recall":<22} {aff_r:>10.4f}')
-        print(f'  {"Aff-F (Aff-F)":<22} {aff_f:>10.4f}')
-        print(f'  {"AUC-ROC (A-ROC)":<22} {auc_roc:>10.4f}')
-        print(f'  {"AUC-PR  (A-PR)":<22} {auc_pr:>10.4f}')
-        print(sep)
-        print(f'  [Summary] F1={f1:.4f} | Aff-F={aff_f:.4f} | '
-              f'A-ROC={auc_roc:.4f} | A-PR={auc_pr:.4f}')
-        print(sep)
-
-        self.logger.info(
-            f'{self.dataset} | F1={f1:.4f} Aff-F={aff_f:.4f} '
-            f'A-ROC={auc_roc:.4f} A-PR={auc_pr:.4f}'
-        )
-        return {'f1': f1, 'aff_f': aff_f, 'auc_roc': auc_roc, 'auc_pr': auc_pr}
+        print(combine_all_evaluation_scores(gt, pred_pa, score))
 
 
 

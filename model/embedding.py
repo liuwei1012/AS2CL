@@ -23,25 +23,41 @@ class PositionalEmbedding(nn.Module):
     
 
 class TokenEmbedding(nn.Module):
+    """
+    逐时间步线性投影 (论文公式 4.8)
+
+    z_t^0 = x_t W_emb + b_emb,  W_emb ∈ R^{D × d_model}
+
+    使用 Conv1d(kernel_size=1) 实现, 等价于对每个时间步独立做线性变换,
+    不混合相邻时间步的信息。
+    """
     def __init__(self, in_dim, d_model):
         super(TokenEmbedding, self).__init__()
-        pad = 1 if torch.__version__ >= '1.5.0' else 2
-        self.conv = nn.Conv1d(in_channels=in_dim, out_channels=d_model, kernel_size=3, padding=pad, 
-                              padding_mode='circular', bias=False)
-        
-        for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+        # kernel_size=1: 逐点卷积, 等价于 nn.Linear(in_dim, d_model)
+        # 每个时间步独立映射, 符合公式 4.8 的逐时间步线性投影
+        self.conv = nn.Conv1d(in_channels=in_dim, out_channels=d_model,
+                              kernel_size=1, bias=True)
+        nn.init.kaiming_normal_(self.conv.weight, mode='fan_in', nonlinearity='leaky_relu')
+        nn.init.zeros_(self.conv.bias)
 
-    # x的形状为(batch_size, seq_len, in_dim)
     def forward(self, x):
-        x = self.conv(x.permute(0, 2, 1)).transpose(1, 2)
-
-        # 最后x的形状为(batch_size, seq_len, d_model)
-        return x
+        # x: [B, L, D] → permute → [B, D, L] → conv1d → [B, d_model, L] → [B, L, d_model]
+        return self.conv(x.permute(0, 2, 1)).transpose(1, 2)
 
 
 class InputEmbedding(nn.Module):
+    """
+    输入嵌入层 (论文公式 4.8-4.9)
+
+    公式 4.8: z_t^0 = x_t W_emb + b_emb
+    公式 4.9: E_t = z_t^0 + PE(t)
+
+    对每个时间步 t 的多维输入 x_t ∈ R^D 进行线性投影到 d_model 维,
+    然后叠加正弦位置编码。
+
+    输入:  x [B, L, D]
+    输出:  E [B, L, d_model]
+    """
     def __init__(self, in_dim, d_model, device, dropout=0.0):
         super(InputEmbedding, self).__init__()
         self.device = device

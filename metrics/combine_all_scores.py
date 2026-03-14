@@ -1,55 +1,74 @@
-from f1_score_f1_pa import *
-from fc_score import *
-from precision_at_k import *
-from customizable_f1_score import *
-from AUC import *
-from Matthews_correlation_coefficient import *
-from affiliation.generics import convert_vector_to_events
-from affiliation.metrics import pr_from_events
-from vus.models.feature import Window
-from vus.metrics import get_range_vus_roc
+from .f1_score_f1_pa import *
+from .fc_score import *
+from .precision_at_k import *
+from .customizable_f1_score import *
+from .AUC import *
+from .Matthews_correlation_coefficient import *
+from .affiliation.generics import convert_vector_to_events
+from .affiliation.metrics import pr_from_events
+from .vus.models.feature import Window
+from .vus.metrics import get_range_vus_roc
+from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import accuracy_score
+import numpy as np
+from sklearn.metrics import f1_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 
-
-def combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores):
-    events_pred = convert_vector_to_events(y_test) # [(4, 5), (8, 9)]
-    events_gt = convert_vector_to_events(pred_labels)     # [(3, 4), (7, 10)]
-    Trange = (0, len(y_test))
+def combine_all_evaluation_scores(gt, pred, anomaly_scores):
+    """
+    计算所有评价指标
+    参数:
+        gt: ground truth labels (真实标签)
+        pred: predicted labels (预测标签)
+        anomaly_scores: anomaly scores (异常分数)
+    """
+    events_pred = convert_vector_to_events(pred)
+    events_gt = convert_vector_to_events(gt)
+    Trange = (0, len(pred))
     affiliation = pr_from_events(events_pred, events_gt, Trange)
-    true_events = get_events(y_test)
-    _, _, _, f1_score_ori, f05_score_ori = get_accuracy_precision_recall_fscore(y_test, pred_labels)
-    f1_score_pa = get_point_adjust_scores(y_test, pred_labels, true_events)[5]
-    pa_accuracy, pa_precision, pa_recall, pa_f_score = get_adjust_F1PA(y_test, pred_labels)
-    range_f_score = customizable_f1_score(y_test, pred_labels)
-    _, _, f1_score_c = get_composite_fscore_raw(y_test, pred_labels,  true_events, return_prec_rec=True)
-    precision_k = precision_at_k(y_test, anomaly_scores, pred_labels)
-    point_auc = point_wise_AUC(pred_labels, y_test)
-    range_auc = Range_AUC(pred_labels, y_test)
-    MCC_score = MCC(y_test, pred_labels)
-    results = get_range_vus_roc(y_test, pred_labels, 100) # slidingWindow = 100 default
+    P = affiliation['precision']
+    R = affiliation['recall']
+    affiliation_F = 2 * P * R / (P + R + 1e-8)
 
-    
-    score_list = {"f1_score_ori": f1_score_ori, 
-                  "f05_score_ori" : f05_score_ori, 
-                  "f1_score_pa": f1_score_pa,
-                  "pa_accuracy":pa_accuracy, 
-                  "pa_precision":pa_precision, 
-                  "pa_recall":pa_recall, 
-                  "pa_f_score":pa_f_score,
-                  "range_f_score": range_f_score,
-                  "f1_score_c": f1_score_c, 
-                  "precision_k": precision_k,
-                  "point_auc": point_auc,
-                  "range_auc": range_auc, 
-                  "MCC_score":MCC_score, 
-                  "Affiliation precision": affiliation['precision'], 
-                  "Affiliation recall": affiliation['recall'],
-                  "R_AUC_ROC": results["R_AUC_ROC"], 
-                  "R_AUC_PR": results["R_AUC_PR"],
-                  "VUS_ROC": results["VUS_ROC"], 
-                  "VUS_PR": results["VUS_PR"]}
-    
-    return score_list
+    accuracy = accuracy_score(gt, pred)
+    precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
+                                                                          average='binary',
+                                                                          zero_division=0)
+    pa_accuracy, pa_precision, pa_recall, pa_f_score = get_adjust_F1PA(pred, gt)
+
+    # 计算 AUC-ROC 和 AUC-PR
+    try:
+        auc_roc = roc_auc_score(gt, anomaly_scores)
+    except:
+        auc_roc = float('nan')
+    try:
+        auc_pr = average_precision_score(gt, anomaly_scores)
+    except:
+        auc_pr = float('nan')
+
+    vus_results = get_range_vus_roc(pred, gt, 100)  # default slidingWindow = 100
+
+    score_list_simple = {
+                    "accuracy": accuracy,
+                    "precision": precision,
+                    "recall": recall,
+                    "f_score": f_score,
+                    "pa_accuracy": pa_accuracy,
+                    "pa_precision": pa_precision,
+                    "pa_recall": pa_recall,
+                    "pa_f_score": pa_f_score,
+                    "Affiliation precision": affiliation['precision'],
+                    "Affiliation recall": affiliation['recall'],
+                    "affiliation_F1": affiliation_F,
+                    "R_AUC_ROC": vus_results["R_AUC_ROC"],
+                    "R_AUC_PR": vus_results["R_AUC_PR"],
+                    "AUC_ROC": auc_roc,
+                    "AUC_PR": auc_pr,
+                    "VUS_ROC": vus_results["VUS_ROC"],
+                    "VUS_PR": vus_results["VUS_PR"]
+                  }
+    return score_list_simple
 
 
 def main():
@@ -63,9 +82,7 @@ def main():
     anomaly_scores[15:17] = 0.7
     anomaly_scores[55:62] = 0.6
     pred_labels[51:55] = 1
-    true_events = get_events(y_test)
     scores = combine_all_evaluation_scores(y_test, pred_labels, anomaly_scores)
-    # scores = test(y_test, pred_labels)
     for key,value in scores.items():
         print(key,' : ',value)
 
